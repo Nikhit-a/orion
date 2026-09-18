@@ -12,8 +12,15 @@ def get_destinations(db: Session = Depends(get_db)):
     return db.query(Destination).all()
 
 @router.get("/guides", response_model=List[GuideResponse])
-def get_guides(language: str = None, specialization: str = None, db: Session = Depends(get_db)):
+def get_guides(
+    destination_id: str = None,
+    language: str = None,
+    specialization: str = None,
+    db: Session = Depends(get_db),
+):
     query = db.query(Guide)
+    if destination_id:
+        query = query.filter(Guide.destination_id == destination_id)
     if language:
         query = query.filter(Guide.languages.contains([language]))
     if specialization:

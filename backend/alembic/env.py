@@ -13,11 +13,6 @@ if config.config_file_name is not None:
 from app.models.base import Base
 import app.models  # Ensure all models are loaded
 
-# Override sqlalchemy.url from app settings so the DATABASE_URL env var
-# (or .env file) always wins over the hardcoded value in alembic.ini.
-from app.core.config import settings
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
-
 target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,

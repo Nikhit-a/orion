@@ -11,9 +11,9 @@ from app.models.trip import Trip, ItineraryItem
 # Synchronous engine logic for simpler seeding
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
+from app.core.config import settings
 
-DATABASE_URL = "postgresql://localhost/packagepro"
-engine = create_engine(DATABASE_URL)
+engine = create_engine(settings.DATABASE_URL)
 
 def seed_db():
     with Session(engine) as session:

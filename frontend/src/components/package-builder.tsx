@@ -48,7 +48,7 @@ export function PackageBuilder({ destinationId }: { destinationId: string }) {
                 </div>
               </div>
               <Button size="sm" variant="outline"
-                onClick={() => addToItinerary({ day: selectedDay, activityId: act.id, activityName: act.name, price: Number(act.base_price) })}>
+                onClick={() => addToItinerary({ day: selectedDay, activityId: act.id, activityName: act.name, activityType: act.activity_type, price: Number(act.base_price) })}>
                 <Plus className="h-3.5 w-3.5 mr-1" /> Add to Day {selectedDay}
               </Button>
             </Card>

@@ -10,6 +10,7 @@ class AgentState(TypedDict, total=False):
 
     # Context
     trip_id: Optional[str]
+    destination_id: Optional[str]
     current_itinerary: List[Dict[str, Any]]
     constraints: Dict[str, Any]
 

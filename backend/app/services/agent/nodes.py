@@ -5,6 +5,7 @@ from app.services.agent.state import AgentState
 from app.services.agent.embeddings import get_embedding
 from app.services.agent.validation import validate_agent_plan
 from app.services.agent.action_engine import commit_agent_action
+from app.services.agent.plan import build_resolution_plan
 from app.db.session import SessionLocal
 from app.models.inventory import Activity
 from app.models.trip import Trip, ItineraryItem
@@ -13,14 +14,17 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _activity_map(db, component_ids: List[str]) -> Dict[str, Activity]:
+    if not component_ids:
+        return {}
+    rows = db.query(Activity).filter(Activity.id.in_(component_ids)).all()
+    return {str(row.id): row for row in rows}
+
+
 def retrieve_context(state: AgentState) -> Dict[str, Any]:
-    """
-    Fetches the active trip and its itinerary from the database.
-    Prefers a trip_id supplied in the event payload; falls back to the most
-    recent ACTIVE/DRAFT trip.
-    """
+    """Fetches the active trip and its itinerary from the database."""
     logger.info("Retrieving context for event: %s", state.get("event_id"))
-    payload = state.get("payload", {})
+    payload = state.get("payload", {}) or {}
     explicit_trip_id = payload.get("trip_id")
 
     try:
@@ -45,9 +49,10 @@ def retrieve_context(state: AgentState) -> Dict[str, Any]:
             if trip is None:
                 logger.warning("No active trip found; using fallback context.")
                 return {
-                    "trip_id": "00000000-0000-0000-0000-000000000000",
+                    "trip_id": None,
                     "current_itinerary": [],
                     "constraints": {"preserve_budget": True, "max_extra_cost": 50},
+                    "destination_id": None,
                     "status": "CONTEXT_RETRIEVED",
                 }
 
@@ -57,17 +62,26 @@ def retrieve_context(state: AgentState) -> Dict[str, Any]:
                 .order_by(ItineraryItem.day_number)
                 .all()
             )
-            itinerary_summary = [
-                {
-                    "item_id": str(item.id),
-                    "day": item.day_number,
-                    "component_type": item.component_type,
-                    "component_id": str(item.component_id),
-                    "status": item.status,
-                    "constraints": item.agent_constraints or {},
-                }
-                for item in items
-            ]
+            activities = _activity_map(db, [str(item.component_id) for item in items])
+            itinerary_summary = []
+            destination_id = None
+            for item in items:
+                activity = activities.get(str(item.component_id))
+                if activity and destination_id is None:
+                    destination_id = str(activity.destination_id)
+                itinerary_summary.append(
+                    {
+                        "item_id": str(item.id),
+                        "day": item.day_number,
+                        "component_type": item.component_type,
+                        "component_id": str(item.component_id),
+                        "status": item.status,
+                        "name": activity.name if activity else None,
+                        "price": float(activity.base_price) if activity else 0.0,
+                        "description": activity.description if activity else None,
+                        "constraints": item.agent_constraints or {},
+                    }
+                )
             constraints = {"preserve_budget": True, "max_extra_cost": 50}
             for item in items:
                 if item.agent_constraints:
@@ -79,61 +93,68 @@ def retrieve_context(state: AgentState) -> Dict[str, Any]:
                 "trip_id": str(trip.id),
                 "current_itinerary": itinerary_summary,
                 "constraints": constraints,
+                "destination_id": destination_id,
                 "status": "CONTEXT_RETRIEVED",
             }
     except Exception as e:
         logger.error("Failed to retrieve trip context: %s", e)
         return {
-            "trip_id": "00000000-0000-0000-0000-000000000000",
+            "trip_id": None,
             "current_itinerary": [],
             "constraints": {"preserve_budget": True, "max_extra_cost": 50},
+            "destination_id": None,
             "status": "CONTEXT_RETRIEVED",
         }
 
 
 def search_alternatives(state: AgentState) -> Dict[str, Any]:
-    """
-    Semantic search via pgvector cosine distance to find alternative activities.
-    Falls back to ILIKE keyword search if embeddings aren't populated.
-    """
-    query_text = str(state.get("payload", ""))
+    """Semantic search via pgvector cosine distance, with keyword fallback."""
+    payload = state.get("payload", {}) or {}
+    itinerary = state.get("current_itinerary") or []
+    disrupted = (
+        payload.get("attraction")
+        or payload.get("activity")
+        or payload.get("guide")
+        or ""
+    )
+    query_text = " ".join(
+        part for part in (disrupted, str(payload.get("reason", "")), " ".join(
+            f"{i.get('name', '')} {i.get('description', '')}" for i in itinerary[:3]
+        )) if part
+    ).strip() or "travel activity alternative"
     logger.info("Searching alternatives using vector search...")
     query_embedding = get_embedding(query_text)
+    destination_id = state.get("destination_id")
+    occupied_ids = {str(i.get("component_id")) for i in itinerary}
 
     try:
         with SessionLocal() as db:
             results = []
+            query = db.query(Activity).filter(Activity.embedding.isnot(None))
+            if destination_id:
+                query = query.filter(Activity.destination_id == destination_id)
             try:
-                rows = (
-                    db.query(Activity)
-                    .filter(Activity.embedding.isnot(None))
-                    .order_by(Activity.embedding.cosine_distance(query_embedding))
-                    .limit(3)
-                    .all()
-                )
-                results = rows
-                logger.info("pgvector search returned %d candidates.", len(results))
+                rows = query.order_by(Activity.embedding.cosine_distance(query_embedding)).limit(8).all()
+                results = [row for row in rows if str(row.id) not in occupied_ids][:3]
+                logger.info("pgvector search returned %d unused candidates.", len(results))
             except Exception as vec_err:
                 logger.warning("pgvector search failed (%s). Falling back to keyword search.", vec_err)
 
             if not results:
-                keyword = (
-                    state.get("payload", {}).get("attraction", "")
-                    or state.get("payload", {}).get("activity", "")
-                    or ""
-                )
+                keyword = disrupted or ""
+                fallback = db.query(Activity)
+                if destination_id:
+                    fallback = fallback.filter(Activity.destination_id == destination_id)
                 if keyword:
-                    rows = (
-                        db.query(Activity)
-                        .filter(
-                            Activity.name.ilike(f"%{keyword}%")
-                            | Activity.description.ilike(f"%{keyword}%")
-                        )
-                        .limit(3)
-                        .all()
+                    fallback = fallback.filter(
+                        Activity.name.ilike(f"%{keyword}%")
+                        | Activity.description.ilike(f"%{keyword}%")
                     )
-                    results = rows
-                    logger.info("Keyword fallback returned %d candidates.", len(results))
+                rows = fallback.limit(8).all()
+                results = [row for row in rows if str(row.id) not in occupied_ids][:3]
+                if not results:
+                    results = [row for row in db.query(Activity).limit(8).all() if str(row.id) not in occupied_ids][:3]
+                logger.info("Keyword/fallback returned %d candidates.", len(results))
 
             return {
                 "search_results": [
@@ -155,49 +176,48 @@ def search_alternatives(state: AgentState) -> Dict[str, Any]:
 
 
 def plan_resolution(state: AgentState) -> Dict[str, Any]:
-    """
-    Uses GPT-4o-mini to propose an itinerary change that resolves the disruption.
-    Falls back to a deterministic mock when no API key is configured.
-    """
-    logger.info("Planning resolution using LLM...")
+    """Propose a structured itinerary replacement using LLM JSON, with a deterministic fallback."""
+    logger.info("Planning resolution...")
+    itinerary = state.get("current_itinerary") or []
+    search_results = state.get("search_results") or []
+    payload = state.get("payload") or {}
+    llm_content = None
 
-    if not settings.OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY not set — using fallback plan.")
-        return {
-            "proposed_changes": {
-                "replace": {"old": "Affected activity", "new": "Alternative activity"},
-                "new_cost": 0,
-            },
-            "reasoning_summary": "Disruption detected. Suggested nearest available alternative.",
-            "status": "PLAN_PROPOSED",
-        }
+    if settings.OPENAI_API_KEY:
+        try:
+            from langchain_openai import ChatOpenAI
 
-    try:
-        from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(model="gpt-4o-mini", api_key=settings.OPENAI_API_KEY)
-        prompt = f"""
-You are an AI travel agent. A disruption has occurred on a planned trip.
+            llm = ChatOpenAI(model="gpt-4o-mini", api_key=settings.OPENAI_API_KEY)
+            prompt = f"""You are an AI travel agent. A disruption has occurred on a planned trip.
+Return ONLY valid JSON with this shape:
+{{
+  "replace": {{"old": "<exact current itinerary item name>", "new": "<exact alternative name from the list>"}},
+  "new_cost": <numeric extra cost vs the old item>,
+  "reasoning_summary": "<one sentence for the traveller>"
+}}
 
-Disruption Event: {state.get('payload')}
-Current Itinerary: {state.get('current_itinerary')}
-Available Alternatives: {state.get('search_results')}
+Disruption Event: {payload}
+Current Itinerary: {itinerary}
+Available Alternatives: {search_results}
 Constraints: {state.get('constraints')}
-
-Propose a JSON change with keys:
-- "replace": {{"old": "<disrupted item>", "new": "<alternative>"}}
-- "new_cost": <cost difference as number>
-
-Also write a one-sentence "reasoning_summary" for the traveller.
 """
-        response = llm.invoke(prompt)
+            response = llm.invoke(prompt)
+            llm_content = getattr(response, "content", None) or str(response)
+        except Exception as e:
+            logger.error("LLM planning failed: %s", e)
+
+    proposed, summary = build_resolution_plan(itinerary, search_results, payload, llm_content)
+    if not proposed:
         return {
-            "proposed_changes": {"replace": {"old": "x", "new": "y"}, "new_cost": 0, "llm_output": response.content},
-            "reasoning_summary": "LLM processed the disruption and proposed a change.",
-            "status": "PLAN_PROPOSED",
+            "proposed_changes": {},
+            "reasoning_summary": summary,
+            "status": "PLAN_FAILED",
         }
-    except Exception as e:
-        logger.error("LLM planning failed: %s", e)
-        return {"status": "PLAN_FAILED"}
+    return {
+        "proposed_changes": proposed,
+        "reasoning_summary": summary,
+        "status": "PLAN_PROPOSED",
+    }
 
 
 def validate_plan(state: AgentState) -> Dict[str, Any]:
@@ -213,6 +233,6 @@ def validate_plan(state: AgentState) -> Dict[str, Any]:
 
 
 def commit_action(state: AgentState) -> Dict[str, Any]:
-    """Writes the audit log and publishes the SSE event."""
+    """Writes the audit log, applies itinerary replacement, and publishes the SSE event."""
     commit_agent_action(state)
     return {"status": "COMPLETED"}
